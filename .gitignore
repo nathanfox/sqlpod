@@ -1,0 +1,11 @@
+# Compiled binary
+/sqlpod
+/sqlpod.exe
+
+# Scratch query files (keep committed examples under docs/ or examples/)
+*.local.sql
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

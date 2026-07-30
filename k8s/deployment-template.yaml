@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sqlpod
+  labels:
+    app: sqlpod
+    language: go
+    purpose: adhoc-sql
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sqlpod
+  template:
+    metadata:
+      labels:
+        app: sqlpod
+        language: go
+        purpose: adhoc-sql
+    spec:
+      # Substituted by manage.sh: an `imagePullSecrets:` block when
+      # IMAGE_PULL_SECRET is set, otherwise blank (public registry).
+      ${IMAGE_PULL_SECRETS_BLOCK}
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: sqlpod
+        image: sqlpod:latest
+        imagePullPolicy: Always
+        # Keep the pod warm; queries run via `kubectl exec ... -- /sqlpod "<SQL>"`.
+        command: ["/sqlpod", "idle"]
+        env:
+        # Read-only connection (default). Secret name/key are parameterized via
+        # envsubst so this can point at an existing secret.
+        - name: SQLPOD_CONN
+          valueFrom:
+            secretKeyRef:
+              name: ${SQLPOD_SECRET_NAME}
+              key: ${SQLPOD_SECRET_KEY}
+        # Optional write-capable connection. --write fails cleanly if this is absent.
+        - name: SQLPOD_CONN_WRITE
+          valueFrom:
+            secretKeyRef:
+              name: ${SQLPOD_SECRET_NAME}
+              key: conn-string-write
+              optional: true
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+            - ALL
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 500m
+            memory: 256Mi
