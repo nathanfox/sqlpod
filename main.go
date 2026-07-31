@@ -1,5 +1,6 @@
-// Command sqlpod executes ad-hoc SQL queries (currently SQL Server) and emits
-// results as JSON.
+// Command sqlpod executes ad-hoc SQL queries (SQL Server, PostgreSQL, or
+// MySQL — inferred from the connection string's scheme) and emits results as
+// JSON.
 //
 // It is meant to run inside a pod in a developer namespace — one pod per
 // developer, each with its own credentials — and be driven over `kubectl exec`.
@@ -31,8 +32,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	_ "github.com/microsoft/go-mssqldb" // registers the "sqlserver" driver
 )
 
 const (
@@ -95,20 +94,24 @@ func run(argv []string) error {
 	if err != nil {
 		return err
 	}
+	info, err := resolveDriver(connStr)
+	if err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	db, err := sql.Open("sqlserver", connStr)
+	db, err := sql.Open(info.name, info.dsn)
 	if err != nil {
-		return fmt.Errorf("open connection: %w", sanitize(err, connStr))
+		return fmt.Errorf("open connection: %w", sanitize(err, connStr, info.dsn))
 	}
 	defer db.Close()
 
 	if *write {
-		return execWrite(ctx, db, sqlText, connStr)
+		return execWrite(ctx, db, sqlText, connStr, info.dsn)
 	}
-	return execRead(ctx, db, sqlText, *maxRows, *format, connStr)
+	return execRead(ctx, db, sqlText, *maxRows, *format, info, connStr)
 }
 
 // connString picks the connection string for the requested mode. Write mode
@@ -152,27 +155,28 @@ func readSQL(args []string, file string) (string, error) {
 }
 
 // execRead runs a query inside a rolled-back transaction and prints the rows.
-func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, format, connStr string) error {
+func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, format string, info driverInfo, connStr string) error {
 	start := time.Now()
-	// Plain transaction, always rolled back. go-mssqldb has no driver-level
-	// read-only transaction (T-SQL lacks SET TRANSACTION READ ONLY), so the
-	// rollback — not a TxOptions flag — is what guarantees nothing persists.
-	tx, err := db.BeginTx(ctx, nil)
+	// info.readTx is ReadOnly where the engine supports it (pgx, mysql), so
+	// the server itself rejects writes. On sqlserver it is nil (T-SQL lacks
+	// SET TRANSACTION READ ONLY) and the rollback below is the only in-engine
+	// guard. Either way the transaction is always rolled back.
+	tx, err := db.BeginTx(ctx, info.readTx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", sanitize(err, connStr))
+		return fmt.Errorf("begin tx: %w", sanitize(err, connStr, info.dsn))
 	}
 	// Always discard: read mode must never persist side effects.
 	defer tx.Rollback()
 
 	rows, err := tx.QueryContext(ctx, sqlText)
 	if err != nil {
-		return fmt.Errorf("query: %w", sanitize(err, connStr))
+		return fmt.Errorf("query: %w", sanitize(err, connStr, info.dsn))
 	}
 	defer rows.Close()
 
 	cols, err := rows.Columns()
 	if err != nil {
-		return fmt.Errorf("columns: %w", sanitize(err, connStr))
+		return fmt.Errorf("columns: %w", sanitize(err, connStr, info.dsn))
 	}
 
 	out := make([][]any, 0, maxRows)
@@ -188,7 +192,7 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 			ptrs[i] = &raw[i]
 		}
 		if err := rows.Scan(ptrs...); err != nil {
-			return fmt.Errorf("scan: %w", sanitize(err, connStr))
+			return fmt.Errorf("scan: %w", sanitize(err, connStr, info.dsn))
 		}
 		for i := range raw {
 			raw[i] = coerce(raw[i])
@@ -196,7 +200,7 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 		out = append(out, raw)
 	}
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate rows: %w", sanitize(err, connStr))
+		return fmt.Errorf("iterate rows: %w", sanitize(err, connStr, info.dsn))
 	}
 
 	if format == "tsv" {
@@ -214,20 +218,20 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 }
 
 // execWrite runs a statement and commits, reporting rows affected.
-func execWrite(ctx context.Context, db *sql.DB, sqlText, connStr string) error {
+func execWrite(ctx context.Context, db *sql.DB, sqlText, connStr, dsn string) error {
 	start := time.Now()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", sanitize(err, connStr))
+		return fmt.Errorf("begin tx: %w", sanitize(err, connStr, dsn))
 	}
 	res, err := tx.ExecContext(ctx, sqlText)
 	if err != nil {
 		_ = tx.Rollback()
-		return fmt.Errorf("exec: %w", sanitize(err, connStr))
+		return fmt.Errorf("exec: %w", sanitize(err, connStr, dsn))
 	}
 	affected, affErr := res.RowsAffected()
 	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit: %w", sanitize(err, connStr))
+		return fmt.Errorf("commit: %w", sanitize(err, connStr, dsn))
 	}
 	result := map[string]any{
 		"mode":       "write",
@@ -285,16 +289,20 @@ func emitError(err error) {
 	_ = enc.Encode(map[string]any{"error": err.Error()})
 }
 
-// sanitize strips the connection string out of an error message so credentials
-// never reach stdout/stderr or logs. go-mssqldb generally avoids embedding the
-// DSN in errors, but this guards against that and any wrapped variants.
-func sanitize(err error, connStr string) error {
+// sanitize strips connection strings out of an error message so credentials
+// never reach stdout/stderr or logs. The drivers generally avoid embedding the
+// DSN in errors, but this guards against that and any wrapped variants. Both
+// the original env DSN and the driver-normalized form are passed, since an
+// error could embed either.
+func sanitize(err error, secrets ...string) error {
 	if err == nil {
 		return nil
 	}
 	msg := err.Error()
-	if connStr != "" && strings.Contains(msg, connStr) {
-		msg = strings.ReplaceAll(msg, connStr, "<connection-string-redacted>")
+	for _, s := range secrets {
+		if s != "" && strings.Contains(msg, s) {
+			msg = strings.ReplaceAll(msg, s, "<connection-string-redacted>")
+		}
 	}
 	return errors.New(msg)
 }

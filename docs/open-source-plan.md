@@ -148,7 +148,7 @@ own read and optional write credentials, selected per query.
 |---|---|---|---|
 | 1 | Tests — **done** | Refactor `writeTSV` to take `io.Writer`; add `main_test.go` covering `coerce`, `sanitize`, `readSQL`, `connString` (all four env combinations via `t.Setenv`), `writeTSV` | `go test ./...` green; the read/write env invariants have explicit tests |
 | 2 | CI/CD + publish — **done** | Workflows from §6; Dockerfile TARGETOS/TARGETARCH; tag `v0.1.0` | Multi-arch image pullable from GHCR (`ghcr.io/nathanfox/sqlpod`); CI green on PR |
-| 3 | Multi-DB | `drivers.go` per §4; pgx + mysql deps; per-driver read-only enforcement per §3; docs | Queries verified against real Postgres + MySQL instances; MySQL DDL caveat documented |
+| 3 | Multi-DB — **done** | `drivers.go` per §4; pgx + mysql deps; per-driver read-only enforcement per §3; docs | Queries verified against real Postgres + MySQL instances; MySQL DDL caveat documented |
 | 4 | Named connections | `--conn` flag per §5; manage.sh `set-conn --name`; generalized secret-key preservation; manifest env generation from `SQLPOD_CONNECTIONS` | Two named connections + default coexist on one pod; write isolation verified per connection |
 | 5 | Polish | CONTRIBUTING.md, examples/ (per-DB secret + DSN samples), `--version` via ldflags in release workflow | — |
 

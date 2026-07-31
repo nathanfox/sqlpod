@@ -82,6 +82,17 @@ func TestSanitize(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("multiple secrets each redacted", func(t *testing.T) {
+		orig := "mysql://user:pw@host/db"
+		normalized := "user:pw@tcp(host:3306)/db?parseTime=true"
+		err := errors.New("dial " + normalized + " (from " + orig + ") failed")
+		got := sanitize(err, orig, normalized)
+		want := "dial <connection-string-redacted> (from <connection-string-redacted>) failed"
+		if got.Error() != want {
+			t.Errorf("sanitize() = %q, want %q", got.Error(), want)
+		}
+	})
 }
 
 func TestConnString(t *testing.T) {
