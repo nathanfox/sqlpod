@@ -1,5 +1,7 @@
 # sqlpod
 
+[![CI](https://github.com/nathanfox/sqlpod/actions/workflows/ci.yml/badge.svg)](https://github.com/nathanfox/sqlpod/actions/workflows/ci.yml)
+
 A tiny tool for running **ad-hoc SQL queries** against a database the cluster can reach but
 your laptop can't. It deploys a small Go binary into your developer namespace; you drive it over
 `kubectl exec` and get results back as JSON. Designed to be driven by an AI agent (queries in,
@@ -57,6 +59,13 @@ export REGISTRY=ghcr.io/youruser              # where you push the image
 ./manage.sh push
 ./manage.sh deploy
 ./manage.sh status                            # confirm the pod is Running
+```
+
+Prefer not to build? A prebuilt multi-arch image (amd64/arm64) is published to
+`ghcr.io/nathanfox/sqlpod` on every release — skip `build`/`push` and deploy it directly:
+
+```bash
+REGISTRY=ghcr.io/nathanfox IMAGE_TAG=v0.1.0 ./manage.sh deploy
 ```
 
 Connection-string format is the go-mssqldb URL form:

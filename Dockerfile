@@ -8,7 +8,13 @@ RUN go mod download
 
 COPY . .
 # Pure-Go driver, so CGO can stay off -> fully static binary that runs on scratch/distroless.
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /sqlpod .
+# TARGETOS/TARGETARCH are set per-platform by buildx for multi-arch release
+# builds; under a plain `docker build` they are empty and Go targets the build
+# container's own platform. No --platform=$BUILDPLATFORM pin on the build
+# stage: it would break the classic (non-BuildKit) builder some operators
+# still run, so release builds emulate instead (QEMU in the workflow).
+ARG TARGETOS TARGETARCH
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /sqlpod .
 
 # distroless/static:nonroot — no shell, no package manager, runs as uid 65532.
 FROM gcr.io/distroless/static:nonroot

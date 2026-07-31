@@ -135,14 +135,19 @@ own read and optional write credentials, selected per query.
   `platforms: linux/amd64,linux/arm64`; tags via metadata-action (`vX.Y.Z`, `latest`).
 - Dockerfile change: use buildx `TARGETOS`/`TARGETARCH` build args instead of
   hardcoded `GOOS=linux` so the same Dockerfile cross-compiles both platforms.
+  Deliberately **no** `FROM --platform=$BUILDPLATFORM` native-cross-compile pin:
+  tested and it breaks plain `docker build` under the classic (non-BuildKit)
+  builder that some `manage.sh build` users still run ("" is an invalid platform).
+  The cost is QEMU-emulated Go compiles in the release job — acceptable for a
+  binary this small.
 - No goreleaser / binary artifacts for v1 — the image is the deliverable.
 
 ## 7. Roadmap
 
 | # | Session | Contents | Acceptance criteria |
 |---|---|---|---|
-| 1 | Tests | Refactor `writeTSV` to take `io.Writer`; add `main_test.go` covering `coerce`, `sanitize`, `readSQL`, `connString` (all four env combinations via `t.Setenv`), `writeTSV` | `go test ./...` green; the read/write env invariants have explicit tests |
-| 2 | CI/CD + publish | Workflows from §6; Dockerfile TARGETOS/TARGETARCH; tag `v0.1.0` | Multi-arch image pullable from GHCR (`ghcr.io/nathanfox/sqlpod`); CI green on PR |
+| 1 | Tests — **done** | Refactor `writeTSV` to take `io.Writer`; add `main_test.go` covering `coerce`, `sanitize`, `readSQL`, `connString` (all four env combinations via `t.Setenv`), `writeTSV` | `go test ./...` green; the read/write env invariants have explicit tests |
+| 2 | CI/CD + publish — **done** | Workflows from §6; Dockerfile TARGETOS/TARGETARCH; tag `v0.1.0` | Multi-arch image pullable from GHCR (`ghcr.io/nathanfox/sqlpod`); CI green on PR |
 | 3 | Multi-DB | `drivers.go` per §4; pgx + mysql deps; per-driver read-only enforcement per §3; docs | Queries verified against real Postgres + MySQL instances; MySQL DDL caveat documented |
 | 4 | Named connections | `--conn` flag per §5; manage.sh `set-conn --name`; generalized secret-key preservation; manifest env generation from `SQLPOD_CONNECTIONS` | Two named connections + default coexist on one pod; write isolation verified per connection |
 | 5 | Polish | CONTRIBUTING.md, examples/ (per-DB secret + DSN samples), `--version` via ldflags in release workflow | — |
