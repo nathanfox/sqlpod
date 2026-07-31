@@ -200,7 +200,7 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 	}
 
 	if format == "tsv" {
-		return writeTSV(cols, out)
+		return writeTSV(os.Stdout, cols, out)
 	}
 	return emit(map[string]any{
 		"mode":       "read",
@@ -253,8 +253,7 @@ func coerce(v any) any {
 	}
 }
 
-func writeTSV(cols []string, rows [][]any) error {
-	w := os.Stdout
+func writeTSV(w io.Writer, cols []string, rows [][]any) error {
 	if _, err := fmt.Fprintln(w, strings.Join(cols, "\t")); err != nil {
 		return err
 	}
