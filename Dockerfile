@@ -14,7 +14,8 @@ COPY . .
 # stage: it would break the classic (non-BuildKit) builder some operators
 # still run, so release builds emulate instead (QEMU in the workflow).
 ARG TARGETOS TARGETARCH
-RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w" -o /sqlpod .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags="-s -w -X main.version=${VERSION}" -o /sqlpod .
 
 # distroless/static:nonroot — no shell, no package manager, runs as uid 65532.
 FROM gcr.io/distroless/static:nonroot

@@ -1,0 +1,28 @@
+# Named connections: one pod serving several databases.
+#
+# Deploy with the names wired into the pod's env, then select per query:
+#
+#   kubectl apply -n <namespace> -f named-connections.yaml
+#   SQLPOD_CONNECTIONS=orders,warehouse NAMESPACE=<namespace> ./manage.sh deploy
+#
+#   ./query.sh query "SELECT 1"                                  # default conn
+#   ./query.sh query --conn orders "SELECT ..."                  # read
+#   ./query.sh query --conn orders --write "INSERT ..."          # commits
+#   ./query.sh query --conn warehouse --write "..."              # fails: no
+#                                            # conn-string-warehouse-write key
+#
+# Write isolation is per connection: --conn X --write uses exactly
+# conn-string-x-write and never falls back to any other key.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: sqlpod-conn-secret
+type: Opaque
+stringData:
+  # Default connection (query.sh without --conn).
+  conn-string: "postgres://reader:password@pg.example.internal:5432/app?sslmode=require"
+  # "orders": read + write credentials.
+  conn-string-orders: "postgres://orders_ro:password@pg.example.internal:5432/orders?sslmode=require"
+  conn-string-orders-write: "postgres://orders_rw:password@pg.example.internal:5432/orders?sslmode=require"
+  # "warehouse": read-only — no -write key, so --write can never touch it.
+  conn-string-warehouse: "mysql://wh_ro:password@mysql.example.internal:3306/warehouse"

@@ -90,8 +90,10 @@ cmd_build() {
     require_command docker
     require_registry
     local img; img=$(full_image_name)
-    log_info "Building image: ${img}"
-    docker build -t "$img" -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}"
+    local ver
+    ver=$(git -C "$SCRIPT_DIR" describe --tags --always 2>/dev/null || echo dev)
+    log_info "Building image: ${img} (version ${ver})"
+    docker build -t "$img" --build-arg VERSION="$ver" -f "${SCRIPT_DIR}/Dockerfile" "${SCRIPT_DIR}"
     log_success "Image built: ${img}"
 }
 

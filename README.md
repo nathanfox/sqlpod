@@ -210,7 +210,13 @@ Errors go to stderr as `{"error":"..."}` with a non-zero exit; the connection st
 | `query.sh` | agent-facing driver: run queries via kubectl exec |
 | `manage.sh` | operator lifecycle: build / push / deploy / secrets |
 | `scripts/lib.sh` | logging + kubectl helpers shared by both scripts |
+| `examples/` | per-engine secret manifests and a named-connections sample |
 | `docs/open-source-plan.md` | roadmap and design decisions |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — checks, local database testing, and the
+invariants PRs must not break.
 
 ## License
 

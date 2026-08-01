@@ -2,7 +2,9 @@
 # lib.sh — logging, argument parsing, and kubectl helpers shared by manage.sh
 # and query.sh. Self-contained.
 
-readonly VERSION="0.3.0"
+# Derived from the checkout's latest tag; "dev" when the scripts are vendored
+# outside a git checkout. SCRIPT_DIR is set by the sourcing script.
+readonly VERSION="$(git -C "${SCRIPT_DIR:-.}" describe --tags --abbrev=0 2>/dev/null || echo dev)"
 
 readonly COLOR_RED='\033[0;31m'
 readonly COLOR_GREEN='\033[0;32m'

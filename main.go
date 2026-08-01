@@ -39,6 +39,10 @@ const (
 	envConnWrite = "SQLPOD_CONN_WRITE"
 )
 
+// version is stamped by the release build via
+// -ldflags "-X main.version=vX.Y.Z"; source builds report "dev".
+var version = "dev"
+
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "idle" {
 		// Container entrypoint: stay alive so the pod is warm for `kubectl exec`.
@@ -67,6 +71,7 @@ func run(argv []string) error {
 		maxRows = fs.Int("max-rows", 1000, "maximum rows to return before truncating")
 		timeout = fs.Duration("timeout", 30*time.Second, "overall timeout (connect + query + fetch)")
 		format  = fs.String("format", "json", "output format: json or tsv")
+		showVer = fs.Bool("version", false, "print version and exit")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: sqlpod [flags] \"<SQL>\"\n       sqlpod [flags] --file query.sql\n       echo \"<SQL>\" | sqlpod [flags]\n\nflags:\n")
@@ -78,6 +83,11 @@ func run(argv []string) error {
 			os.Exit(0)
 		}
 		return err
+	}
+
+	if *showVer {
+		fmt.Println("sqlpod " + version)
+		return nil
 	}
 
 	sqlText, err := readSQL(fs.Args(), *file)
