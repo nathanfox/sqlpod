@@ -31,6 +31,7 @@ COMMANDS:
 
 FLAGS (forwarded to the pod binary):
     --write               Use the write connection and COMMIT (default: read-only)
+    --conn NAME           Use a named connection (SQLPOD_CONN_<NAME>) instead of the default
     --max-rows N          Maximum rows before truncating (default: 1000)
     --timeout DUR         Overall timeout (default: 30s)
     --format json|tsv     Output format (default: json)
@@ -41,6 +42,7 @@ EXAMPLES:
     $SCRIPT_NAME query --max-rows 5000 "SELECT * FROM dbo.BigTable"
     $SCRIPT_NAME query-file report.sql
     $SCRIPT_NAME query --write "UPDATE dbo.Orders SET status='x' WHERE id=1"
+    $SCRIPT_NAME query --conn warehouse "SELECT COUNT(*) FROM inventory"
 
 Deployment and secrets are managed with manage.sh.
 EOF
@@ -51,7 +53,7 @@ cmd_query_file() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             # Flags that take a separate value argument.
-            --max-rows|--timeout|--format) passthru+=("$1" "$2"); shift 2 ;;
+            --max-rows|--timeout|--format|--conn) passthru+=("$1" "$2"); shift 2 ;;
             -*) passthru+=("$1"); shift ;;
             *) file="$1"; shift ;;
         esac

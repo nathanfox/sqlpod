@@ -2,7 +2,7 @@
 # lib.sh — logging, argument parsing, and kubectl helpers shared by manage.sh
 # and query.sh. Self-contained.
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.3.0"
 
 readonly COLOR_RED='\033[0;31m'
 readonly COLOR_GREEN='\033[0;32m'

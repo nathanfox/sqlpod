@@ -113,8 +113,11 @@ own read and optional write credentials, selected per query.
 - manage.sh: `set-conn --name orders "<dsn>"`, `set-conn-write --name orders ...`;
   deployment env block generated from `SQLPOD_CONNECTIONS="orders,warehouse"`.
   Prerequisite fix: generalize `set_conn_key` to preserve **all** existing secret
-  keys (it preserves only the single counterpart key — with more than two keys,
-  `kubectl apply`'s 3-way merge would drop the others).
+  keys (it preserved only the single counterpart key — with more than two keys,
+  `kubectl apply`'s 3-way merge would drop the others). *Implemented (session 4)
+  with `kubectl patch --type=merge` per key instead of re-applying the whole
+  secret: preservation of unrelated keys holds by construction, and secrets are
+  never `kubectl apply`'d at all anymore.*
 
 **Rejected:**
 - *Mounted YAML config file*: adds a projected volume, a YAML dependency, and a
@@ -149,7 +152,7 @@ own read and optional write credentials, selected per query.
 | 1 | Tests — **done** | Refactor `writeTSV` to take `io.Writer`; add `main_test.go` covering `coerce`, `sanitize`, `readSQL`, `connString` (all four env combinations via `t.Setenv`), `writeTSV` | `go test ./...` green; the read/write env invariants have explicit tests |
 | 2 | CI/CD + publish — **done** | Workflows from §6; Dockerfile TARGETOS/TARGETARCH; tag `v0.1.0` | Multi-arch image pullable from GHCR (`ghcr.io/nathanfox/sqlpod`); CI green on PR |
 | 3 | Multi-DB — **done** | `drivers.go` per §4; pgx + mysql deps; per-driver read-only enforcement per §3; docs | Queries verified against real Postgres + MySQL instances; MySQL DDL caveat documented |
-| 4 | Named connections | `--conn` flag per §5; manage.sh `set-conn --name`; generalized secret-key preservation; manifest env generation from `SQLPOD_CONNECTIONS` | Two named connections + default coexist on one pod; write isolation verified per connection |
+| 4 | Named connections — **done** | `--conn` flag per §5; manage.sh `set-conn --name`; generalized secret-key preservation; manifest env generation from `SQLPOD_CONNECTIONS` | Two named connections + default coexist on one pod; write isolation verified per connection |
 | 5 | Polish | CONTRIBUTING.md, examples/ (per-DB secret + DSN samples), `--version` via ldflags in release workflow | — |
 
 ## 8. Open items

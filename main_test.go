@@ -119,7 +119,7 @@ func TestConnString(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(envConn, tt.conn)
 			t.Setenv(envConnWrite, tt.connW)
-			got, err := connString(tt.write)
+			got, err := connString(tt.write, "")
 			if tt.wantErr != "" {
 				if err == nil {
 					t.Fatalf("connString(%v) = %q, want error mentioning %s", tt.write, got, tt.wantErr)
@@ -134,6 +134,74 @@ func TestConnString(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("connString(%v) = %q, want %q", tt.write, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestConnStringNamed(t *testing.T) {
+	const (
+		defRead  = "postgres://def-reader@db/d"
+		defWrite = "postgres://def-writer@db/d"
+		ordRead  = "postgres://orders-reader@db/o"
+		ordWrite = "postgres://orders-writer@db/o"
+		wareRead = "mysql://warehouse-reader@db/w"
+		euRead   = "postgres://eu-reader@db/e"
+	)
+	setAll := func(t *testing.T) {
+		t.Setenv("SQLPOD_CONN", defRead)
+		t.Setenv("SQLPOD_CONN_WRITE", defWrite)
+		t.Setenv("SQLPOD_CONN_ORDERS", ordRead)
+		t.Setenv("SQLPOD_CONN_ORDERS_WRITE", ordWrite)
+		t.Setenv("SQLPOD_CONN_WAREHOUSE", wareRead)
+		t.Setenv("SQLPOD_CONN_ORDERS_EU", euRead)
+	}
+
+	t.Run("named read", func(t *testing.T) {
+		setAll(t)
+		got, err := connString(false, "orders")
+		if err != nil || got != ordRead {
+			t.Errorf("connString(false, orders) = %q, %v; want %q", got, err, ordRead)
+		}
+	})
+	t.Run("named write", func(t *testing.T) {
+		setAll(t)
+		got, err := connString(true, "orders")
+		if err != nil || got != ordWrite {
+			t.Errorf("connString(true, orders) = %q, %v; want %q", got, err, ordWrite)
+		}
+	})
+	t.Run("dash maps to underscore", func(t *testing.T) {
+		setAll(t)
+		got, err := connString(false, "orders-eu")
+		if err != nil || got != euRead {
+			t.Errorf("connString(false, orders-eu) = %q, %v; want %q", got, err, euRead)
+		}
+	})
+	t.Run("named write never falls back", func(t *testing.T) {
+		// warehouse has a read conn, a default write exists, orders has a
+		// write conn — none of them may satisfy --conn warehouse --write.
+		setAll(t)
+		got, err := connString(true, "warehouse")
+		if err == nil {
+			t.Fatalf("connString(true, warehouse) = %q, want error", got)
+		}
+		if !strings.Contains(err.Error(), "SQLPOD_CONN_WAREHOUSE_WRITE") {
+			t.Errorf("error = %q, want mention of SQLPOD_CONN_WAREHOUSE_WRITE", err)
+		}
+	})
+	t.Run("unknown name errors with exact var", func(t *testing.T) {
+		setAll(t)
+		_, err := connString(false, "nope")
+		if err == nil || !strings.Contains(err.Error(), "SQLPOD_CONN_NOPE") {
+			t.Errorf("error = %v, want mention of SQLPOD_CONN_NOPE", err)
+		}
+	})
+	for _, bad := range []string{"bad_name", "bad!", "9lives", "-x"} {
+		t.Run("invalid name "+bad, func(t *testing.T) {
+			setAll(t)
+			if _, err := connString(false, bad); err == nil {
+				t.Errorf("connString(false, %q) succeeded, want validation error", bad)
 			}
 		})
 	}

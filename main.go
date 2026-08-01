@@ -62,6 +62,7 @@ func run(argv []string) error {
 	fs := flag.NewFlagSet("sqlpod", flag.ContinueOnError)
 	var (
 		write   = fs.Bool("write", false, "use the write connection and COMMIT (default: read-only, rolled back)")
+		conn    = fs.String("conn", "", "named connection: look up SQLPOD_CONN_<NAME> (and _WRITE) instead of SQLPOD_CONN")
 		file    = fs.String("file", "", "read SQL from this file instead of an argument")
 		maxRows = fs.Int("max-rows", 1000, "maximum rows to return before truncating")
 		timeout = fs.Duration("timeout", 30*time.Second, "overall timeout (connect + query + fetch)")
@@ -90,7 +91,7 @@ func run(argv []string) error {
 		return fmt.Errorf("unknown --format %q (want json or tsv)", *format)
 	}
 
-	connStr, err := connString(*write)
+	connStr, err := connString(*write, *conn)
 	if err != nil {
 		return err
 	}
@@ -114,21 +115,49 @@ func run(argv []string) error {
 	return execRead(ctx, db, sqlText, *maxRows, *format, info, connStr)
 }
 
-// connString picks the connection string for the requested mode. Write mode
-// refuses to fall back to the read connection.
-func connString(write bool) (string, error) {
-	if write {
-		c := os.Getenv(envConnWrite)
-		if c == "" {
-			return "", fmt.Errorf("write mode requested but %s is not set", envConnWrite)
+// connString picks the connection string for the requested mode and (optional)
+// named connection. The env var name is built as SQLPOD_CONN[_<NAME>][_WRITE],
+// so write mode looks up exactly the write variable for that connection and
+// refuses to fall back — neither to the connection's read variable nor to the
+// default write variable.
+func connString(write bool, conn string) (string, error) {
+	envVar := envConn
+	if conn != "" {
+		suffix, err := connEnvSuffix(conn)
+		if err != nil {
+			return "", err
 		}
-		return c, nil
+		envVar += "_" + suffix
 	}
-	c := os.Getenv(envConn)
+	if write {
+		envVar += "_WRITE"
+	}
+	c := os.Getenv(envVar)
 	if c == "" {
-		return "", fmt.Errorf("%s is not set", envConn)
+		if write {
+			return "", fmt.Errorf("write mode requested but %s is not set", envVar)
+		}
+		return "", fmt.Errorf("%s is not set", envVar)
 	}
 	return c, nil
+}
+
+// connEnvSuffix converts a --conn name to its env-var suffix: uppercased with
+// "-" mapped to "_". Names are restricted to what maps cleanly onto both env
+// vars and k8s secret keys.
+func connEnvSuffix(name string) (string, error) {
+	for i, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+		case i > 0 && (r >= '0' && r <= '9' || r == '-'):
+		default:
+			return "", fmt.Errorf("invalid connection name %q (want letters, digits, and dashes, starting with a letter)", name)
+		}
+	}
+	if name == "" {
+		return "", errors.New("empty connection name")
+	}
+	return strings.ReplaceAll(strings.ToUpper(name), "-", "_"), nil
 }
 
 func readSQL(args []string, file string) (string, error) {

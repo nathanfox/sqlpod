@@ -25,6 +25,12 @@ IMAGE_PULL_SECRET="${IMAGE_PULL_SECRET:-}"
 SQLPOD_SECRET_NAME="${SQLPOD_SECRET_NAME:-sqlpod-conn-secret}"
 SQLPOD_SECRET_KEY="${SQLPOD_SECRET_KEY:-conn-string}"
 
+# Comma-separated named connections (e.g. "orders,warehouse") to wire into the
+# deployment's env, in addition to the default connection. Each name maps to
+# secret keys conn-string-<name> / conn-string-<name>-write, queried with
+# `query.sh query --conn <name> ...`.
+SQLPOD_CONNECTIONS="${SQLPOD_CONNECTIONS:-}"
+
 show_help() {
     cat << EOF
 sqlpod — ad-hoc SQL query runner for Kubernetes v${VERSION}
@@ -39,9 +45,9 @@ OPTIONS:
 
 LIFECYCLE COMMANDS:
     setup-namespace       Create the namespace (and copy IMAGE_PULL_SECRET if set)
-    set-conn "<CONN>"     Set the read-only connection string secret
-    set-conn-write "<CONN>"  Set the write-capable connection string secret
-    clear-conn-write      Remove the write-capable connection string secret
+    set-conn [--name N] "<CONN>"        Set a read-only connection string
+    set-conn-write [--name N] "<CONN>"  Set a write-capable connection string
+    clear-conn-write [--name N]         Remove a write-capable connection string
     build                 Build the Docker image
     push                  Push the image to the registry
     deploy                Deploy (or re-deploy) to the namespace
@@ -58,6 +64,12 @@ EXAMPLES:
     $SCRIPT_NAME setup-namespace
     $SCRIPT_NAME set-conn "sqlserver://user:pass@host:1433?database=mydb"
     $SCRIPT_NAME build && $SCRIPT_NAME push && $SCRIPT_NAME deploy
+
+Named connections (one pod, several databases — queried with query.sh --conn):
+    $SCRIPT_NAME set-conn --name orders "postgres://reader:pass@pg:5432/orders"
+    $SCRIPT_NAME set-conn-write --name orders "postgres://writer:pass@pg:5432/orders"
+    $SCRIPT_NAME set-conn --name warehouse "mysql://reader:pass@my:3306/warehouse"
+    SQLPOD_CONNECTIONS=orders,warehouse $SCRIPT_NAME deploy
 
 Reuse an existing secret instead of sqlpod-conn-secret:
     SQLPOD_SECRET_NAME=my-existing-secret SQLPOD_SECRET_KEY=conn-string $SCRIPT_NAME deploy
@@ -111,8 +123,27 @@ cmd_deploy() {
         IMAGE_PULL_SECRETS_BLOCK=$'imagePullSecrets:\n      - name: '"${IMAGE_PULL_SECRET}"
     fi
 
-    export SQLPOD_SECRET_NAME SQLPOD_SECRET_KEY IMAGE_PULL_SECRETS_BLOCK
-    envsubst '${SQLPOD_SECRET_NAME} ${SQLPOD_SECRET_KEY} ${IMAGE_PULL_SECRETS_BLOCK}' \
+    # Named-connection env entries, generated from SQLPOD_CONNECTIONS. Both
+    # keys are optional so the pod starts even before the secret keys exist;
+    # queries against a missing key fail with the exact env-var name. The
+    # first substituted line continues the template's 8-space indentation;
+    # every following line carries its own.
+    local NAMED_CONN_ENV_BLOCK=""
+    if [ -n "$SQLPOD_CONNECTIONS" ]; then
+        local name lc uc
+        for name in $(echo "$SQLPOD_CONNECTIONS" | tr ',' ' '); do
+            validate_conn_name "$name"
+            lc=$(echo "$name" | tr '[:upper:]' '[:lower:]')
+            uc=$(echo "$lc" | tr '[:lower:]-' '[:upper:]_')
+            [ -n "$NAMED_CONN_ENV_BLOCK" ] && NAMED_CONN_ENV_BLOCK+=$'\n        '
+            NAMED_CONN_ENV_BLOCK+="- name: SQLPOD_CONN_${uc}"$'\n          valueFrom:\n            secretKeyRef:\n              name: '"${SQLPOD_SECRET_NAME}"$'\n              key: conn-string-'"${lc}"$'\n              optional: true'
+            NAMED_CONN_ENV_BLOCK+=$'\n        '"- name: SQLPOD_CONN_${uc}_WRITE"$'\n          valueFrom:\n            secretKeyRef:\n              name: '"${SQLPOD_SECRET_NAME}"$'\n              key: conn-string-'"${lc}"$'-write\n              optional: true'
+        done
+        log_info "Named connections wired into deployment: ${SQLPOD_CONNECTIONS}"
+    fi
+
+    export SQLPOD_SECRET_NAME SQLPOD_SECRET_KEY IMAGE_PULL_SECRETS_BLOCK NAMED_CONN_ENV_BLOCK
+    envsubst '${SQLPOD_SECRET_NAME} ${SQLPOD_SECRET_KEY} ${IMAGE_PULL_SECRETS_BLOCK} ${NAMED_CONN_ENV_BLOCK}' \
         < "$tmp/deployment-template.yaml" > "$tmp/deployment.yaml"
     rm "$tmp/deployment-template.yaml"
 
@@ -190,12 +221,57 @@ cmd_setup_namespace() {
     log_info "Next: ${SCRIPT_NAME} set-conn \"<connection-string>\""
 }
 
-# set_conn_key writes a single key into the connection secret without disturbing
-# any other key already present. The manifest handed to `kubectl apply` must
-# therefore carry every key we want to keep: apply does a 3-way merge and DROPS
-# any key that is missing from the manifest but present in the last-applied
-# config. So we read the counterpart key back and re-supply it; otherwise
-# set-conn and set-conn-write would clobber each other.
+# validate_conn_name enforces the same rule as the pod binary's --conn flag:
+# letters, digits, and dashes, starting with a letter. Names are lowercased for
+# secret keys; the binary uppercases them (with - → _) for env-var lookup.
+validate_conn_name() {
+    if ! [[ "$1" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+        log_error "Invalid connection name '$1' (want letters, digits, and dashes, starting with a letter)"
+        exit 1
+    fi
+}
+
+# parse_conn_cmd_args handles [--name N] plus an optional value for the
+# set-conn/set-conn-write/clear-conn-write commands. Sets CONN_NAME (lowercased)
+# and CONN_VALUE.
+parse_conn_cmd_args() {
+    CONN_NAME=""
+    CONN_VALUE=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)
+                [ -z "${2:-}" ] && { log_error "--name requires a value"; exit 1; }
+                validate_conn_name "$2"
+                CONN_NAME=$(echo "$2" | tr '[:upper:]' '[:lower:]')
+                shift 2
+                ;;
+            *) CONN_VALUE="$1"; shift ;;
+        esac
+    done
+}
+
+# read_key_name/write_key_name map a connection name to its secret keys. The
+# default (unnamed) read key stays overridable via SQLPOD_SECRET_KEY.
+read_key_name() {
+    if [ -n "$CONN_NAME" ]; then echo "conn-string-${CONN_NAME}"; else echo "$SQLPOD_SECRET_KEY"; fi
+}
+write_key_name() {
+    if [ -n "$CONN_NAME" ]; then echo "conn-string-${CONN_NAME}-write"; else echo "conn-string-write"; fi
+}
+
+# json_escape emits a JSON string literal (quotes included) for embedding a
+# value in a kubectl patch.
+json_escape() {
+    local s="$1"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    printf '"%s"' "$s"
+}
+
+# set_conn_key writes a single key into the connection secret. Uses a merge
+# patch, which touches only that key — every other key in the secret is
+# preserved by construction (secrets are never `kubectl apply`'d, so apply's
+# 3-way-merge key-dropping behavior is out of the picture entirely).
 set_conn_key() {
     require_namespace
     check_kubectl
@@ -205,65 +281,41 @@ set_conn_key() {
         exit 1
     fi
 
-    local -a literals=(--from-literal="${key}=${value}")
-
-    # Preserve the counterpart connection key if it already exists.
-    local other
-    if [ "$key" = "conn-string-write" ]; then
-        other="conn-string"
+    if kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" &>/dev/null; then
+        kubectl patch secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" --type=merge \
+            -p "{\"stringData\":{$(json_escape "$key"):$(json_escape "$value")}}" >/dev/null
     else
-        other="conn-string-write"
+        kubectl create secret generic "$SQLPOD_SECRET_NAME" \
+            --namespace "$NAMESPACE" \
+            --from-literal="${key}=${value}" >/dev/null
     fi
-    local otherval
-    otherval=$(kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" \
-                 -o "jsonpath={.data['${other}']}" 2>/dev/null | base64 -d 2>/dev/null)
-    if [ -n "$otherval" ]; then
-        literals+=(--from-literal="${other}=${otherval}")
-    fi
-
-    kubectl create secret generic "$SQLPOD_SECRET_NAME" \
-        --namespace "$NAMESPACE" \
-        "${literals[@]}" \
-        --dry-run=client -o yaml | kubectl apply -f -
     log_success "Set ${SQLPOD_SECRET_NAME}/${key} in ${NAMESPACE}"
     log_info "Restart the pod to pick it up: ${SCRIPT_NAME} deploy"
 }
 
-# clear_conn_write drops the write-capable key from the connection secret while
-# preserving the read-only key. Same merge caveat as set_conn_key: the manifest
-# we apply carries only the read key, so `apply`'s 3-way merge DROPS
-# conn-string-write from the live secret.
-clear_conn_write() {
+# clear_conn_key removes a single key from the connection secret, leaving all
+# other keys untouched (JSON merge patch: null deletes the key).
+clear_conn_key() {
     require_namespace
     check_kubectl
+    local key="$1"
 
     if ! kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" &>/dev/null; then
         log_warn "Secret '${SQLPOD_SECRET_NAME}' not found in '${NAMESPACE}' — nothing to clear"
         return 0
     fi
 
-    local writeval
-    writeval=$(kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" \
-                 -o "jsonpath={.data['conn-string-write']}" 2>/dev/null | base64 -d 2>/dev/null)
-    if [ -z "$writeval" ]; then
-        log_info "No write connection string set in ${SQLPOD_SECRET_NAME} — nothing to clear"
+    local val
+    val=$(kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" \
+            -o "jsonpath={.data['${key}']}" 2>/dev/null)
+    if [ -z "$val" ]; then
+        log_info "No ${key} set in ${SQLPOD_SECRET_NAME} — nothing to clear"
         return 0
     fi
 
-    # Preserve the read-only key if it exists; otherwise nothing is left to keep.
-    local readval
-    readval=$(kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" \
-                -o "jsonpath={.data['${SQLPOD_SECRET_KEY}']}" 2>/dev/null | base64 -d 2>/dev/null)
-
-    if [ -n "$readval" ]; then
-        kubectl create secret generic "$SQLPOD_SECRET_NAME" \
-            --namespace "$NAMESPACE" \
-            --from-literal="${SQLPOD_SECRET_KEY}=${readval}" \
-            --dry-run=client -o yaml | kubectl apply -f -
-    else
-        kubectl delete secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE"
-    fi
-    log_success "Cleared write connection string from ${SQLPOD_SECRET_NAME} in ${NAMESPACE}"
+    kubectl patch secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" --type=merge \
+        -p "{\"data\":{$(json_escape "$key"):null}}" >/dev/null
+    log_success "Cleared ${key} from ${SQLPOD_SECRET_NAME} in ${NAMESPACE}"
     log_info "Restart the pod to pick it up: ${SCRIPT_NAME} deploy"
 }
 
@@ -281,9 +333,18 @@ main() {
         status)          cmd_status ;;
         logs)            cmd_logs "$@" ;;
         setup-namespace) cmd_setup_namespace ;;
-        set-conn)        set_conn_key "$SQLPOD_SECRET_KEY" "$1" ;;
-        set-conn-write)  set_conn_key "conn-string-write" "$1" ;;
-        clear-conn-write) clear_conn_write ;;
+        set-conn)
+            parse_conn_cmd_args "$@"
+            set_conn_key "$(read_key_name)" "$CONN_VALUE"
+            ;;
+        set-conn-write)
+            parse_conn_cmd_args "$@"
+            set_conn_key "$(write_key_name)" "$CONN_VALUE"
+            ;;
+        clear-conn-write)
+            parse_conn_cmd_args "$@"
+            clear_conn_key "$(write_key_name)"
+            ;;
         query|query-file)
             log_error "Queries moved to query.sh: ./query.sh ${command} ..."
             exit 1

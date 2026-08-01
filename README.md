@@ -146,6 +146,35 @@ can exec can use `--write` if that pod has a write key. So:
   fleet of agents.
 - **Never set a write key on a shared pod.** Writes go through a personal pod.
 
+### Named connections (one pod, several databases)
+
+A single pod can serve several databases, each with its own read and optional write
+credentials, selected per query:
+
+```bash
+./manage.sh set-conn --name orders "postgres://reader:pass@pg:5432/orders"
+./manage.sh set-conn-write --name orders "postgres://writer:pass@pg:5432/orders"
+./manage.sh set-conn --name warehouse "mysql://reader:pass@my:3306/warehouse"
+SQLPOD_CONNECTIONS=orders,warehouse ./manage.sh deploy
+
+./query.sh query --conn orders "SELECT * FROM customers LIMIT 5"
+./query.sh query --conn warehouse "SELECT COUNT(*) FROM inventory"
+./query.sh query "SELECT 1"                    # the default connection still works
+```
+
+Names are letters/digits/dashes. Each maps to secret keys and env vars mechanically:
+
+| | Secret key | Env var |
+|---|---|---|
+| read | `conn-string-<name>` | `SQLPOD_CONN_<NAME>` |
+| write | `conn-string-<name>-write` | `SQLPOD_CONN_<NAME>_WRITE` |
+
+Write isolation is **per connection**: `--conn orders --write` looks up exactly
+`SQLPOD_CONN_ORDERS_WRITE` and fails cleanly if it isn't set — it never falls back to the
+connection's read credentials or to another connection's write key. A shared read-only pod can
+therefore expose several databases to a team or agent fleet; the never-set-a-write-key-on-a-shared-pod
+rule applies per connection, same as before.
+
 ### Output
 
 Read mode:
@@ -163,7 +192,6 @@ Errors go to stderr as `{"error":"..."}` with a non-zero exit; the connection st
 
 ## Notes / limitations (v1)
 
-- One database per pod for now (named connections for multiple databases are planned).
 - Raw SQL only — no bound parameters yet.
 - On MySQL, some exact-numeric types (e.g. `DECIMAL`) may serialize as JSON strings rather than
   numbers — that's the driver's lossless representation.
