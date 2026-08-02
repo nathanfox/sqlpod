@@ -49,19 +49,30 @@ require_namespace() {
 # caller can `shift` past them to reach the subcommand.
 parse_args() {
     ARGS_SHIFT=0
+    # require_value FLAG — the option takes a value; dying on a bare `shift 2`
+    # under set -e would print nothing at all.
+    require_value() {
+        if [ $# -lt 2 ] || [ -z "$2" ]; then
+            log_error "$1 requires a value"
+            exit 1
+        fi
+    }
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -n|--namespace)
+                require_value "$1" "${2:-}"
                 NAMESPACE="$2"
                 shift 2
                 ARGS_SHIFT=$((ARGS_SHIFT + 2))
                 ;;
             -r|--registry)
+                require_value "$1" "${2:-}"
                 REGISTRY="$2"
                 shift 2
                 ARGS_SHIFT=$((ARGS_SHIFT + 2))
                 ;;
             -t|--tag)
+                require_value "$1" "${2:-}"
                 IMAGE_TAG="$2"
                 shift 2
                 ARGS_SHIFT=$((ARGS_SHIFT + 2))
@@ -75,12 +86,9 @@ parse_args() {
                 exit 0
                 ;;
             -*)
-                if [ $# -eq 1 ]; then
-                    log_error "Unknown option: $1"
-                    show_help
-                    exit 1
-                fi
-                break
+                log_error "Unknown option: $1"
+                show_help
+                exit 1
                 ;;
             *)
                 break
@@ -99,12 +107,17 @@ get_pod_name() {
 
     check_kubectl
 
+    # Only Running pods, newest first: during a rolling restart the old
+    # Terminating pod coexists with its replacement, and exec'ing into it
+    # either fails or runs the stale image.
     local pod_name
     pod_name=$(kubectl get pods -n "$namespace" -l "app=${app_label}" \
-        -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)
+        --field-selector=status.phase=Running \
+        --sort-by=.metadata.creationTimestamp \
+        -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | awk '{print $NF}')
 
     if [ -z "$pod_name" ]; then
-        log_error "No pod found with label app=${app_label} in namespace $namespace"
+        log_error "No running pod found with label app=${app_label} in namespace $namespace"
         return 1
     fi
 
@@ -139,7 +152,10 @@ wait_for_deployment_ready() {
 
     log_info "Waiting for deployment to be ready: $deployment (timeout: ${timeout}s)"
 
-    if kubectl wait --for=condition=available deployment/"$deployment" -n "$namespace" --timeout="${timeout}s" 2>/dev/null; then
+    # `rollout status` tracks the in-flight rollout; `wait --for=condition=
+    # available` would return immediately during a rolling restart because
+    # the old replica keeps the deployment Available throughout.
+    if kubectl rollout status deployment/"$deployment" -n "$namespace" --timeout="${timeout}s"; then
         log_success "Deployment is ready: $deployment"
         return 0
     else

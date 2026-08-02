@@ -71,7 +71,9 @@ cleanup() {
             docker rm -f "$REGISTRY_NAME" > /dev/null 2>&1 || true
         fi
     fi
-    [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+    if [ -n "$TMP_DIR" ]; then
+        rm -rf "$TMP_DIR"
+    fi
     exit "$rc"
 }
 trap cleanup EXIT
@@ -180,16 +182,19 @@ kubectl rollout status deployment/postgres -n "$NAMESPACE" --timeout=90s > /dev/
 
 # Postgres may still be initializing right after rollout; retry the first query.
 first=""
+last_err=""
 for _ in $(seq 1 15); do
-    if first=$("$ROOT/query.sh" query "SELECT 1 AS one" 2> /dev/null); then
+    if first=$("$ROOT/query.sh" query "SELECT 1 AS one" 2> "$TMP_DIR/query-err"); then
         break
     fi
     first=""
+    last_err=$(cat "$TMP_DIR/query-err")
     sleep 2
 done
 if [ -z "$first" ]; then
     check_fail "basic read query returned a result"
     log_error "Postgres never became queryable; aborting remaining checks"
+    log_error "last query error: ${last_err}"
     exit 1
 fi
 assert_jq "$first" '.mode == "read"' "read query reports mode=read"

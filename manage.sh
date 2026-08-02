@@ -33,7 +33,7 @@ SQLPOD_CONNECTIONS="${SQLPOD_CONNECTIONS:-}"
 
 show_help() {
     cat << EOF
-sqlpod — ad-hoc SQL query runner for Kubernetes v${VERSION}
+sqlpod — ad-hoc SQL query runner for Kubernetes (${VERSION})
 
 Usage: $SCRIPT_NAME [OPTIONS] COMMAND [ARGS]
 
@@ -42,6 +42,7 @@ OPTIONS:
     -r, --registry URL    Image registry (or set REGISTRY env var)
     -t, --tag TAG         Image tag (default: latest)
     -h, --help            Show this help
+    -v, --version         Print the script version
 
 LIFECYCLE COMMANDS:
     setup-namespace       Create the namespace (and copy IMAGE_PULL_SECRET if set)
@@ -116,6 +117,8 @@ cmd_deploy() {
     log_info "Deploying ${APP_NAME} to namespace ${NAMESPACE} (image: ${img})"
 
     local tmp; tmp=$(mktemp -d)
+    # shellcheck disable=SC2064 — expand $tmp now; it is local to this call.
+    trap "rm -rf '$tmp'" EXIT
     cp -r "${SCRIPT_DIR}/k8s/." "$tmp/"
 
     # imagePullSecrets is included only when IMAGE_PULL_SECRET is set. The
@@ -151,9 +154,12 @@ cmd_deploy() {
 
     sed -i.bak "s|image: ${IMAGE_NAME}:latest|image: ${img}|g" "$tmp/deployment.yaml"
     rm -f "$tmp/deployment.yaml.bak"
+    if ! grep -qF -- "image: ${img}" "$tmp/deployment.yaml"; then
+        log_error "Image replacement failed — template image line drifted from '${IMAGE_NAME}:latest'"
+        exit 1
+    fi
 
     apply_manifests "$NAMESPACE" "$tmp"
-    rm -rf "$tmp"
 
     log_info "Triggering rolling restart to pull the latest image..."
     kubectl rollout restart deployment "$APP_NAME" -n "$NAMESPACE"
@@ -181,8 +187,15 @@ cmd_logs() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --follow|-f) follow=true; shift ;;
-            --tail) tail="$2"; shift 2 ;;
-            *) shift ;;
+            --tail)
+                if [ $# -lt 2 ]; then
+                    log_error "--tail requires a value"
+                    exit 1
+                fi
+                tail="$2"; shift 2 ;;
+            *)
+                log_error "Unknown logs argument: $1 (allowed: --follow/-f, --tail N)"
+                exit 1 ;;
         esac
     done
     local pod; pod=$(get_pod_name "$NAMESPACE" "$APP_NAME") || exit 1
@@ -198,8 +211,10 @@ copy_secret() {
         return 1
     fi
     log_info "Copying secret: ${name}"
+    # Anchored to metadata indentation so data keys that merely contain these
+    # words (e.g. a key named "druid") are not stripped.
     kubectl get secret "$name" -n "$src_ns" -o yaml \
-        | sed -e '/namespace:/d' -e '/resourceVersion:/d' -e '/uid:/d' -e '/creationTimestamp:/d' \
+        | sed -e '/^  namespace:/d' -e '/^  resourceVersion:/d' -e '/^  uid:/d' -e '/^  creationTimestamp:/d' \
         | kubectl apply -n "$NAMESPACE" -f -
 }
 
@@ -239,6 +254,7 @@ validate_conn_name() {
 parse_conn_cmd_args() {
     CONN_NAME=""
     CONN_VALUE=""
+    local value_set=false
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --name)
@@ -247,7 +263,22 @@ parse_conn_cmd_args() {
                 CONN_NAME=$(echo "$2" | tr '[:upper:]' '[:lower:]')
                 shift 2
                 ;;
-            *) CONN_VALUE="$1"; shift ;;
+            -*)
+                # A typo'd or wrong flag (e.g. query.sh's --conn) must not be
+                # silently swallowed as the value — that would overwrite the
+                # default connection string.
+                log_error "Unknown flag: $1 (did you mean --name?)"
+                exit 1
+                ;;
+            *)
+                if [ "$value_set" = true ]; then
+                    log_error "Unexpected extra argument: $1 (quote the connection string as a single argument)"
+                    exit 1
+                fi
+                CONN_VALUE="$1"
+                value_set=true
+                shift
+                ;;
         esac
     done
 }
@@ -267,6 +298,9 @@ json_escape() {
     local s="$1"
     s=${s//\\/\\\\}
     s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
     printf '"%s"' "$s"
 }
 

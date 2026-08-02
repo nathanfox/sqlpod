@@ -17,13 +17,14 @@ NAMESPACE="${NAMESPACE:-}"
 
 show_help() {
     cat << EOF
-query.sh — run SQL through the sqlpod pod v${VERSION}
+query.sh — run SQL through the sqlpod pod (${VERSION})
 
 Usage: $SCRIPT_NAME [OPTIONS] COMMAND [ARGS]
 
 OPTIONS:
     -n, --namespace NS    Kubernetes namespace (or set NAMESPACE env var)
     -h, --help            Show this help
+    -v, --version         Print the script version
 
 COMMANDS:
     query [FLAGS] "<SQL>"   Run a query, print JSON
@@ -48,21 +49,53 @@ Deployment and secrets are managed with manage.sh.
 EOF
 }
 
-cmd_query_file() {
-    local passthru=() file=""
+# parse_query_flags ARGS... — validates the agent-facing flag surface and
+# splits it from the single positional argument (SQL text or file path).
+# Only the documented flags are forwarded: the pod binary accepts more (e.g.
+# --file, which reads arbitrary in-pod paths), and none of that may be
+# reachable through query.sh. Sets PASSTHRU and POSITIONAL.
+parse_query_flags() {
+    PASSTHRU=()
+    POSITIONAL=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            # Flags that take a separate value argument.
-            --max-rows|--timeout|--format|--conn) passthru+=("$1" "$2"); shift 2 ;;
-            -*) passthru+=("$1"); shift ;;
-            *) file="$1"; shift ;;
+            --write)
+                PASSTHRU+=("$1"); shift ;;
+            --conn|--max-rows|--timeout|--format)
+                if [ $# -lt 2 ]; then
+                    log_error "$1 requires a value"
+                    exit 1
+                fi
+                PASSTHRU+=("$1" "$2"); shift 2 ;;
+            -*)
+                log_error "Unknown flag: $1 (allowed: --write, --conn NAME, --max-rows N, --timeout DUR, --format json|tsv)"
+                exit 1 ;;
+            *)
+                if [ -n "$POSITIONAL" ]; then
+                    log_error "Unexpected extra argument: $1 (quote the SQL as a single argument)"
+                    exit 1
+                fi
+                POSITIONAL="$1"; shift ;;
         esac
     done
-    if [ -z "$file" ] || [ ! -f "$file" ]; then
+}
+
+cmd_query() {
+    parse_query_flags "$@"
+    if [ -z "$POSITIONAL" ]; then
+        log_error "query requires a SQL string argument"
+        exit 1
+    fi
+    run_query "${PASSTHRU[@]}" "$POSITIONAL"
+}
+
+cmd_query_file() {
+    parse_query_flags "$@"
+    if [ -z "$POSITIONAL" ] || [ ! -f "$POSITIONAL" ]; then
         log_error "query-file requires a path to an existing .sql file"
         exit 1
     fi
-    run_query --stdin "${passthru[@]}" < "$file"
+    run_query --stdin "${PASSTHRU[@]}" < "$POSITIONAL"
 }
 
 main() {
@@ -72,7 +105,7 @@ main() {
     shift || true
 
     case "$command" in
-        query)           run_query "$@" ;;
+        query)           cmd_query "$@" ;;
         query-file)      cmd_query_file "$@" ;;
         help|--help|-h)  show_help ;;
         *) log_error "Unknown command: ${command}"; show_help; exit 1 ;;
