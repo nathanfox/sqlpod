@@ -21,6 +21,8 @@ spec:
       # Substituted by manage.sh: an `imagePullSecrets:` block when
       # IMAGE_PULL_SECRET is set, otherwise blank (public registry).
       ${IMAGE_PULL_SECRETS_BLOCK}
+      # The binary never talks to the Kubernetes API; don't mount a token.
+      automountServiceAccountToken: false
       securityContext:
         runAsNonRoot: true
         seccompProfile:

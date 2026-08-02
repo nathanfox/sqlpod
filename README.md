@@ -185,6 +185,18 @@ Read mode:
 ```
 
 `truncated: true` means the result hit `--max-rows` (default 1000) — add a filter or raise the cap.
+`moreResultSets: true` (SQL Server batches / stored procedures) means only the first result set
+was returned; run the statements separately to see the rest.
+
+Value encoding: dates/times are RFC 3339 strings; binary values that aren't valid UTF-8
+(`VARBINARY`, `ROWVERSION`, MySQL `BIT`, ...) are base64 strings; SQL Server `UNIQUEIDENTIFIER`
+renders as a canonical GUID string; non-finite floats become `"NaN"` / `"Infinity"` / `"-Infinity"`.
+
+`--format tsv` prints a header line then tab-joined rows (`NULL` for nulls; tabs, newlines, and
+backslashes inside values are escaped as `\t`, `\n`, `\\`); truncation is reported on stderr.
+
+Flags must come **before** the SQL argument — a trailing flag is rejected rather than silently
+joined into the SQL text.
 
 Write mode: `{"durationMs":8,"mode":"write","rowsAffected":1}`.
 

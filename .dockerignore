@@ -1,0 +1,14 @@
+# Keep the build context to what the Dockerfile actually compiles.
+.git
+.github
+docs
+examples
+k8s
+scripts
+*.md
+sqlpod
+manage.sh
+query.sh
+LICENSE
+.dockerignore
+.gitignore

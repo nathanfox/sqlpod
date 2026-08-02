@@ -4,8 +4,10 @@ Sample Kubernetes Secret manifests for each supported engine, as an
 alternative to `manage.sh set-conn` (which creates the same thing). Pick one,
 edit the DSN, and:
 
+From the repository root:
+
 ```bash
-kubectl apply -n <your-namespace> -f secret-postgres.yaml
+kubectl apply -n <your-namespace> -f examples/secret-postgres.yaml
 NAMESPACE=<your-namespace> REGISTRY=ghcr.io/nathanfox ./manage.sh deploy
 ```
 
