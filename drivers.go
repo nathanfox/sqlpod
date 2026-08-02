@@ -2,11 +2,13 @@ package main
 
 import (
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
 
-	_ "github.com/go-sql-driver/mysql"  // registers the "mysql" driver
+	"github.com/go-sql-driver/mysql"
 	_ "github.com/jackc/pgx/v5/stdlib"  // registers the "pgx" driver
 	_ "github.com/microsoft/go-mssqldb" // registers the "sqlserver" driver
 )
@@ -16,7 +18,13 @@ import (
 // options for read mode.
 type driverInfo struct {
 	name string // driver name for sql.Open
-	dsn  string // normalized DSN handed to the driver
+	dsn  string // normalized DSN handed to the driver ("" when connector is set)
+
+	// connector, when non-nil, is opened via sql.OpenDB instead of
+	// sql.Open(name, dsn). mysql:// URLs resolve to a connector so
+	// credentials and database names never round-trip through a text DSN
+	// (whose format cannot represent e.g. ':' in a username).
+	connector driver.Connector
 
 	// readTx is the transaction options for read mode. Where the driver
 	// supports it (pgx, mysql), ReadOnly makes the server itself reject
@@ -41,46 +49,72 @@ func resolveDriver(dsn string) (driverInfo, error) {
 	case "postgres", "postgresql":
 		return driverInfo{name: "pgx", dsn: dsn, readTx: &sql.TxOptions{ReadOnly: true}}, nil
 	case "mysql":
-		normalized, err := mysqlDSN(dsn)
+		cfg, err := mysqlConfig(dsn)
 		if err != nil {
 			return driverInfo{}, err
 		}
-		return driverInfo{name: "mysql", dsn: normalized, readTx: &sql.TxOptions{ReadOnly: true}}, nil
+		connector, err := mysql.NewConnector(cfg)
+		if err != nil {
+			return driverInfo{}, fmt.Errorf("mysql config: %w", err)
+		}
+		return driverInfo{name: "mysql", connector: connector, readTx: &sql.TxOptions{ReadOnly: true}}, nil
 	default:
-		return driverInfo{}, fmt.Errorf("unsupported connection scheme %q (supported: sqlserver://, postgres://, postgresql://, mysql://)", scheme)
+		// Echo the scheme only when it is actually scheme-shaped: an ADO-style
+		// string with a URL-valued parameter can put credentials before the
+		// first "://", and those must never reach the error message.
+		if schemeLike(scheme) {
+			return driverInfo{}, fmt.Errorf("unsupported connection scheme %q (supported: sqlserver://, postgres://, postgresql://, mysql://)", scheme)
+		}
+		return driverInfo{}, errors.New("unsupported connection string (supported schemes: sqlserver://, postgres://, postgresql://, mysql://)")
 	}
 }
 
-// mysqlDSN translates a mysql:// URL into go-sql-driver's native format
-// (user:pass@tcp(host:port)/db?params). parseTime=true is added unless already
-// present, so DATETIME/TIMESTAMP columns scan as time.Time instead of []byte.
-func mysqlDSN(dsn string) (string, error) {
+// schemeLike reports whether s looks like a URL scheme (RFC 3986) of sane
+// length, i.e. is safe to echo back in an error message.
+func schemeLike(s string) bool {
+	if s == "" || len(s) > 20 {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+		case i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '.' || r == '-'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// mysqlConfig translates a mysql:// URL into a mysql.Config. Userinfo, host,
+// and database name are set as decoded struct fields rather than re-encoded
+// into go-sql-driver's text DSN format, which cannot represent characters like
+// ':' in a username or '%' in a database name. Query parameters are handed to
+// the driver's own DSN parser so known options (charset, timeout, tls, ...)
+// keep their native semantics. parseTime defaults to true so DATETIME/
+// TIMESTAMP columns scan as time.Time instead of []byte.
+func mysqlConfig(dsn string) (*mysql.Config, error) {
 	u, err := url.Parse(dsn)
 	if err != nil {
-		return "", fmt.Errorf("parse mysql DSN: %w", err)
+		// Deliberately not wrapped: url.Error's message embeds the full raw
+		// URL, credentials included.
+		return nil, errors.New("parse mysql DSN: invalid mysql:// URL (check URL-encoding of special characters)")
 	}
-
-	var b strings.Builder
-	if u.User != nil {
-		b.WriteString(u.User.Username())
-		if pw, ok := u.User.Password(); ok {
-			b.WriteString(":")
-			b.WriteString(pw)
-		}
-		b.WriteString("@")
+	cfg, err := mysql.ParseDSN("/?" + u.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("parse mysql DSN params: %w", err)
 	}
+	if !u.Query().Has("parseTime") {
+		cfg.ParseTime = true
+	}
+	cfg.User = u.User.Username()
+	cfg.Passwd, _ = u.User.Password()
+	cfg.Net = "tcp"
 	host := u.Host
 	if u.Port() == "" {
 		host += ":3306"
 	}
-	fmt.Fprintf(&b, "tcp(%s)/", host)
-	b.WriteString(strings.TrimPrefix(u.Path, "/"))
-
-	q := u.Query()
-	if q.Get("parseTime") == "" {
-		q.Set("parseTime", "true")
-	}
-	b.WriteString("?")
-	b.WriteString(q.Encode())
-	return b.String(), nil
+	cfg.Addr = host
+	cfg.DBName = strings.TrimPrefix(u.Path, "/")
+	return cfg, nil
 }

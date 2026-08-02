@@ -22,16 +22,21 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
+
+	mssql "github.com/microsoft/go-mssqldb"
 )
 
 const (
@@ -56,13 +61,13 @@ func main() {
 		return
 	}
 
-	if err := run(os.Args[1:]); err != nil {
+	if err := run(os.Args[1:], os.Stdout); err != nil {
 		emitError(err)
 		os.Exit(1)
 	}
 }
 
-func run(argv []string) error {
+func run(argv []string, out io.Writer) error {
 	fs := flag.NewFlagSet("sqlpod", flag.ContinueOnError)
 	var (
 		write   = fs.Bool("write", false, "use the write connection and COMMIT (default: read-only, rolled back)")
@@ -73,16 +78,34 @@ func run(argv []string) error {
 		format  = fs.String("format", "json", "output format: json or tsv")
 		showVer = fs.Bool("version", false, "print version and exit")
 	)
-	fs.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: sqlpod [flags] \"<SQL>\"\n       sqlpod [flags] --file query.sql\n       echo \"<SQL>\" | sqlpod [flags]\n\nflags:\n")
+	// Parse errors are reported once, through the JSON error contract: the
+	// flag package's own printing (error line + usage dump) is suppressed,
+	// and -h prints the usage explicitly.
+	usage := func(w io.Writer) {
+		fmt.Fprintf(w, "usage: sqlpod [flags] \"<SQL>\"\n       sqlpod [flags] --file query.sql\n       echo \"<SQL>\" | sqlpod [flags]\n\nflags:\n")
+		fs.SetOutput(w)
 		fs.PrintDefaults()
+		fs.SetOutput(io.Discard)
 	}
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	if err := fs.Parse(argv); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
-			// Usage was already printed; -h/-help is not an error.
+			usage(os.Stderr)
 			os.Exit(0)
 		}
-		return err
+		return fmt.Errorf("%v (run with -h for usage)", err)
+	}
+	// The flag package stops at the first non-flag argument, so anything
+	// flag-shaped after the SQL would silently become part of the SQL text —
+	// on some engines a trailing "--write" turns into a comment and a write
+	// runs (and rolls back) in read mode while looking successful.
+	if args := fs.Args(); len(args) > 1 {
+		for _, a := range args[1:] {
+			if strings.HasPrefix(a, "-") {
+				return fmt.Errorf("argument %q comes after the SQL; flags must precede the SQL argument", a)
+			}
+		}
 	}
 
 	if *showVer {
@@ -100,6 +123,9 @@ func run(argv []string) error {
 	if *format != "json" && *format != "tsv" {
 		return fmt.Errorf("unknown --format %q (want json or tsv)", *format)
 	}
+	if *maxRows < 1 {
+		return fmt.Errorf("invalid --max-rows %d (must be at least 1)", *maxRows)
+	}
 
 	connStr, err := connString(*write, *conn)
 	if err != nil {
@@ -107,22 +133,27 @@ func run(argv []string) error {
 	}
 	info, err := resolveDriver(connStr)
 	if err != nil {
-		return err
+		return sanitize(err, connStr)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()
 
-	db, err := sql.Open(info.name, info.dsn)
-	if err != nil {
-		return fmt.Errorf("open connection: %w", sanitize(err, connStr, info.dsn))
+	var db *sql.DB
+	if info.connector != nil {
+		db = sql.OpenDB(info.connector)
+	} else {
+		db, err = sql.Open(info.name, info.dsn)
+		if err != nil {
+			return fmt.Errorf("open connection: %w", sanitize(err, connStr, info.dsn))
+		}
 	}
 	defer db.Close()
 
 	if *write {
-		return execWrite(ctx, db, sqlText, connStr, info.dsn)
+		return execWrite(ctx, db, sqlText, connStr, info.dsn, out)
 	}
-	return execRead(ctx, db, sqlText, *maxRows, *format, info, connStr)
+	return execRead(ctx, db, sqlText, *maxRows, *format, info, connStr, out)
 }
 
 // connString picks the connection string for the requested mode and (optional)
@@ -194,7 +225,7 @@ func readSQL(args []string, file string) (string, error) {
 }
 
 // execRead runs a query inside a rolled-back transaction and prints the rows.
-func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, format string, info driverInfo, connStr string) error {
+func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, format string, info driverInfo, connStr string, w io.Writer) error {
 	start := time.Now()
 	// info.readTx is ReadOnly where the engine supports it (pgx, mysql), so
 	// the server itself rejects writes. On sqlserver it is nil (T-SQL lacks
@@ -217,11 +248,22 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 	if err != nil {
 		return fmt.Errorf("columns: %w", sanitize(err, connStr, info.dsn))
 	}
+	// Database type names drive type-specific coercion (e.g. sqlserver
+	// UNIQUEIDENTIFIER arrives as 16 raw bytes). Best-effort: a driver that
+	// cannot report types just gets the default coercion.
+	var dbTypes []string
+	if colTypes, err := rows.ColumnTypes(); err == nil {
+		dbTypes = make([]string, len(colTypes))
+		for i, ct := range colTypes {
+			dbTypes[i] = ct.DatabaseTypeName()
+		}
+	}
 
-	out := make([][]any, 0, maxRows)
+	// Cap the pre-allocation: maxRows is caller input and may be huge.
+	results := make([][]any, 0, min(maxRows, 1024))
 	truncated := false
 	for rows.Next() {
-		if len(out) >= maxRows {
+		if len(results) >= maxRows {
 			truncated = true
 			break
 		}
@@ -234,30 +276,50 @@ func execRead(ctx context.Context, db *sql.DB, sqlText string, maxRows int, form
 			return fmt.Errorf("scan: %w", sanitize(err, connStr, info.dsn))
 		}
 		for i := range raw {
-			raw[i] = coerce(raw[i])
+			var dbType string
+			if dbTypes != nil {
+				dbType = dbTypes[i]
+			}
+			raw[i] = coerce(raw[i], dbType)
 		}
-		out = append(out, raw)
+		results = append(results, raw)
 	}
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate rows: %w", sanitize(err, connStr, info.dsn))
 	}
+	// Statement batches and stored procedures can produce further result
+	// sets; only the first is returned, so at least signal that more exist.
+	moreResultSets := rows.NextResultSet()
 
 	if format == "tsv" {
-		return writeTSV(os.Stdout, cols, out)
+		if err := writeTSV(w, cols, results); err != nil {
+			return err
+		}
+		if truncated {
+			fmt.Fprintf(os.Stderr, "warning: output truncated at %d rows (raise with --max-rows)\n", maxRows)
+		}
+		if moreResultSets {
+			fmt.Fprintln(os.Stderr, "warning: additional result sets were not read")
+		}
+		return nil
 	}
-	return emit(map[string]any{
+	result := map[string]any{
 		"mode":       "read",
 		"columns":    cols,
-		"rows":       out,
-		"rowCount":   len(out),
+		"rows":       results,
+		"rowCount":   len(results),
 		"truncated":  truncated,
 		"maxRows":    maxRows,
 		"durationMs": time.Since(start).Milliseconds(),
-	})
+	}
+	if moreResultSets {
+		result["moreResultSets"] = true
+	}
+	return emit(w, result)
 }
 
 // execWrite runs a statement and commits, reporting rows affected.
-func execWrite(ctx context.Context, db *sql.DB, sqlText, connStr, dsn string) error {
+func execWrite(ctx context.Context, db *sql.DB, sqlText, connStr, dsn string, w io.Writer) error {
 	start := time.Now()
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -279,16 +341,42 @@ func execWrite(ctx context.Context, db *sql.DB, sqlText, connStr, dsn string) er
 	if affErr == nil {
 		result["rowsAffected"] = affected
 	}
-	return emit(result)
+	return emit(w, result)
 }
 
-// coerce converts driver-native values into JSON-friendly forms.
-func coerce(v any) any {
+// coerce converts driver-native values into JSON-friendly forms. dbType is
+// the column's DatabaseTypeName (may be empty when the driver doesn't report
+// one). []byte values that aren't valid UTF-8 are base64-encoded — encoding
+// them as Go strings would irreversibly mangle them into U+FFFD replacements.
+func coerce(v any, dbType string) any {
 	switch t := v.(type) {
 	case nil:
 		return nil
 	case []byte:
-		return string(t)
+		// go-mssqldb scans UNIQUEIDENTIFIER as 16 raw bytes in SQL Server's
+		// mixed-endian layout; UniqueIdentifier owns that swizzle.
+		if dbType == "UNIQUEIDENTIFIER" && len(t) == 16 {
+			var g mssql.UniqueIdentifier
+			if err := g.Scan(t); err == nil {
+				return g.String()
+			}
+		}
+		if utf8.Valid(t) {
+			return string(t)
+		}
+		return base64.StdEncoding.EncodeToString(t)
+	case float64:
+		// encoding/json rejects non-finite floats, which would discard the
+		// entire result set at output time.
+		switch {
+		case math.IsNaN(t):
+			return "NaN"
+		case math.IsInf(t, 1):
+			return "Infinity"
+		case math.IsInf(t, -1):
+			return "-Infinity"
+		}
+		return t
 	case time.Time:
 		return t.Format(time.RFC3339Nano)
 	default:
@@ -296,8 +384,16 @@ func coerce(v any) any {
 	}
 }
 
+// tsvEscaper keeps the row/column grid intact when values contain the
+// delimiters themselves; consumers can reverse it unambiguously.
+var tsvEscaper = strings.NewReplacer("\\", "\\\\", "\t", "\\t", "\n", "\\n", "\r", "\\r")
+
 func writeTSV(w io.Writer, cols []string, rows [][]any) error {
-	if _, err := fmt.Fprintln(w, strings.Join(cols, "\t")); err != nil {
+	headers := make([]string, len(cols))
+	for i, c := range cols {
+		headers[i] = tsvEscaper.Replace(c)
+	}
+	if _, err := fmt.Fprintln(w, strings.Join(headers, "\t")); err != nil {
 		return err
 	}
 	for _, r := range rows {
@@ -306,7 +402,7 @@ func writeTSV(w io.Writer, cols []string, rows [][]any) error {
 			if v == nil {
 				fields[i] = "NULL"
 			} else {
-				fields[i] = fmt.Sprintf("%v", v)
+				fields[i] = tsvEscaper.Replace(fmt.Sprintf("%v", v))
 			}
 		}
 		if _, err := fmt.Fprintln(w, strings.Join(fields, "\t")); err != nil {
@@ -316,8 +412,8 @@ func writeTSV(w io.Writer, cols []string, rows [][]any) error {
 	return nil
 }
 
-func emit(v map[string]any) error {
-	enc := json.NewEncoder(os.Stdout)
+func emit(w io.Writer, v map[string]any) error {
+	enc := json.NewEncoder(w)
 	enc.SetEscapeHTML(false)
 	return enc.Encode(v)
 }
