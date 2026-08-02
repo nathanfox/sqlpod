@@ -45,6 +45,14 @@ For the full kubectl-exec path, deploy into any local cluster (k3s/kind) with
 as-is with a locally built image (patch `imagePullPolicy` to `IfNotPresent`
 if the image only exists in your local daemon).
 
+That path is also scripted: `./scripts/integration-test.sh` builds the image,
+pushes it to a throwaway local registry, deploys into a throwaway namespace
+alongside an in-cluster Postgres, and asserts on `query.sh` behavior (read,
+write, tsv, truncation, named connections, read-only enforcement). It needs
+`docker`, `envsubst`, `jq`, and a kubectl context pointing at a docker-runtime
+cluster (e.g. colima with `--kubernetes`, or minikube with `--driver=docker`);
+set `KEEP=1` to keep the namespace around after a run for debugging.
+
 ## Pull requests
 
 - CI must be green; behavior changes need tests.
