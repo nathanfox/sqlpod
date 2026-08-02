@@ -58,6 +58,22 @@ assert_query() {
     fi
 }
 
+# expect_fail DESCRIPTION GREP_PATTERN CMD... — passes when the command exits
+# non-zero and its combined output mentions the pattern.
+expect_fail() {
+    local desc=$1 pattern=$2 out rc
+    shift 2
+    set +e
+    out=$("$@" 2>&1)
+    rc=$?
+    set -e
+    if [ "$rc" -ne 0 ] && grep -q -- "$pattern" <<< "$out"; then
+        check_pass "$desc"
+    else
+        check_fail "$desc — rc=$rc, output: $out"
+    fi
+}
+
 STARTED_REGISTRY=false
 TMP_DIR=""
 
@@ -245,6 +261,32 @@ if "$ROOT/manage.sh" logs > /dev/null; then
 else
     check_fail "manage.sh logs exits 0"
 fi
+
+# --- Flag-surface and error-contract checks -----------------------------------
+
+expect_fail "query.sh rejects undocumented flags" "Unknown flag" \
+    "$ROOT/query.sh" query --file /etc/hostname "SELECT 1"
+expect_fail "set-conn rejects unknown flags" "Unknown flag" \
+    "$ROOT/manage.sh" set-conn --conn orders "$DSN"
+expect_fail "dangling value flag errors visibly" "requires a value" \
+    "$ROOT/manage.sh" -n
+# query.sh parses known flags wherever they appear, so a trailing --write must
+# come back as a real write — never silently folded into the SQL text.
+assert_query "trailing --write is parsed as a flag, not SQL" '.mode == "write"' \
+    query "SELECT 1" --write
+expect_fail "--max-rows -1 is a clean error" "max-rows" \
+    "$ROOT/query.sh" query --max-rows -1 "SELECT 1"
+
+if "$ROOT/manage.sh" help | head -1 | grep -q "vv"; then
+    check_fail "help header version has no doubled v"
+else
+    check_pass "help header version has no doubled v"
+fi
+
+assert_query "NaN floats serialize as a string" '.rows[0][0] == "NaN"' \
+    query "SELECT 'NaN'::float8 AS x"
+assert_query "non-UTF-8 bytea serializes as base64" '.rows[0][0] == "jwA="' \
+    query "SELECT '\x8f00'::bytea AS b"
 
 # --- Summary ------------------------------------------------------------------
 
