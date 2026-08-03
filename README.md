@@ -79,7 +79,7 @@ Prefer not to build? A prebuilt multi-arch image (amd64/arm64) is published to
 `ghcr.io/nathanfox/sqlpod` on every release — skip `build`/`push` and deploy it directly:
 
 ```bash
-REGISTRY=ghcr.io/nathanfox ./manage.sh deploy   # or pin with IMAGE_TAG=v0.4.0
+REGISTRY=ghcr.io/nathanfox ./manage.sh deploy   # or pin with IMAGE_TAG=v0.5.0
 ```
 
 The database engine is inferred from the connection string's scheme:
