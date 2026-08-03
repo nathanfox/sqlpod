@@ -79,7 +79,7 @@ Prefer not to build? A prebuilt multi-arch image (amd64/arm64) is published to
 `ghcr.io/nathanfox/sqlpod` on every release — skip `build`/`push` and deploy it directly:
 
 ```bash
-REGISTRY=ghcr.io/nathanfox ./manage.sh deploy   # or pin with IMAGE_TAG=v0.5.0
+REGISTRY=ghcr.io/nathanfox ./manage.sh deploy   # or pin with IMAGE_TAG=v0.6.0
 ```
 
 The database engine is inferred from the connection string's scheme:
@@ -155,7 +155,7 @@ credentials, selected per query:
 ./manage.sh set-conn --name orders "postgres://reader:pass@pg:5432/orders"
 ./manage.sh set-conn-write --name orders "postgres://writer:pass@pg:5432/orders"
 ./manage.sh set-conn --name warehouse "mysql://reader:pass@my:3306/warehouse"
-SQLPOD_CONNECTIONS=orders,warehouse ./manage.sh deploy
+./manage.sh deploy   # discovers orders and warehouse from the secret's keys
 
 ./query.sh query --conn orders "SELECT * FROM customers LIMIT 5"
 ./query.sh query --conn warehouse "SELECT COUNT(*) FROM inventory"
@@ -168,6 +168,20 @@ Names are letters/digits/dashes. Each maps to secret keys and env vars mechanica
 |---|---|---|
 | read | `conn-string-<name>` | `SQLPOD_CONN_<NAME>` |
 | write | `conn-string-<name>-write` | `SQLPOD_CONN_<NAME>_WRITE` |
+
+`deploy` discovers named connections from the secret's key *names* (values are
+never read), so a plain re-deploy keeps them wired — the list never has to be
+repeated. `SQLPOD_CONNECTIONS=orders,warehouse ./manage.sh deploy` overrides
+discovery with an explicit list, and `SQLPOD_CONNECTIONS= ./manage.sh deploy`
+(explicitly empty) wires none — for that deploy only, since the keys stay in
+the secret and are re-discovered next time; removing a connection permanently
+means deleting its secret keys. Keys in a reused secret that aren't valid
+connection names are skipped with a warning. One naming caveat: a connection
+literally named `foo-write` has a read key indistinguishable from `foo`'s
+write key, so discovery skips it — wire it with an explicit
+`SQLPOD_CONNECTIONS=foo-write`. `./manage.sh status` shows which connections
+are wired into the deployment versus present in the secret, and warns when
+they differ.
 
 Write isolation is **per connection**: `--conn orders --write` looks up exactly
 `SQLPOD_CONN_ORDERS_WRITE` and fails cleanly if it isn't set — it never falls back to the

@@ -29,6 +29,12 @@ SQLPOD_SECRET_KEY="${SQLPOD_SECRET_KEY:-conn-string}"
 # deployment's env, in addition to the default connection. Each name maps to
 # secret keys conn-string-<name> / conn-string-<name>-write, queried with
 # `query.sh query --conn <name> ...`.
+#
+# Unset (the usual case): deploy discovers the names from the secret's key
+# names, so a plain re-deploy keeps existing named connections wired. Set it
+# to override discovery; set it to the empty string to wire none for that
+# deploy (the keys stay in the secret and are re-discovered next time).
+SQLPOD_CONNECTIONS_SET="${SQLPOD_CONNECTIONS+1}"   # distinguishes unset from ""
 SQLPOD_CONNECTIONS="${SQLPOD_CONNECTIONS:-}"
 
 show_help() {
@@ -53,7 +59,7 @@ LIFECYCLE COMMANDS:
     push                  Push the image to the registry
     deploy                Deploy (or re-deploy) to the namespace
     delete                Delete the deployment
-    status                Show deployment/pod status
+    status                Show deployment/pod status and wired connections
     logs [--follow] [--tail N]   Show pod logs
 
 Queries are run with query.sh (the agent-facing script):
@@ -66,11 +72,13 @@ EXAMPLES:
     $SCRIPT_NAME set-conn "sqlserver://user:pass@host:1433?database=mydb"
     $SCRIPT_NAME build && $SCRIPT_NAME push && $SCRIPT_NAME deploy
 
-Named connections (one pod, several databases — queried with query.sh --conn):
+Named connections (one pod, several databases — queried with query.sh --conn).
+Deploy discovers them from the secret's keys; SQLPOD_CONNECTIONS=a,b overrides
+the list, SQLPOD_CONNECTIONS= (empty) wires none for that deploy:
     $SCRIPT_NAME set-conn --name orders "postgres://reader:pass@pg:5432/orders"
     $SCRIPT_NAME set-conn-write --name orders "postgres://writer:pass@pg:5432/orders"
     $SCRIPT_NAME set-conn --name warehouse "mysql://reader:pass@my:3306/warehouse"
-    SQLPOD_CONNECTIONS=orders,warehouse $SCRIPT_NAME deploy
+    $SCRIPT_NAME deploy
 
 Reuse an existing secret instead of sqlpod-conn-secret:
     SQLPOD_SECRET_NAME=my-existing-secret SQLPOD_SECRET_KEY=conn-string $SCRIPT_NAME deploy
@@ -128,6 +136,17 @@ cmd_deploy() {
         IMAGE_PULL_SECRETS_BLOCK=$'imagePullSecrets:\n      - name: '"${IMAGE_PULL_SECRET}"
     fi
 
+    # SQLPOD_CONNECTIONS unset → the secret is the source of truth: discover
+    # named connections from its key names so a plain re-deploy keeps them
+    # wired (apply's 3-way merge would otherwise drop the env entries). An
+    # explicitly empty SQLPOD_CONNECTIONS= wires none.
+    if [ -z "$SQLPOD_CONNECTIONS_SET" ]; then
+        SQLPOD_CONNECTIONS=$(discover_connections)
+        if [ -n "$SQLPOD_CONNECTIONS" ]; then
+            log_info "Discovered named connections from secret ${SQLPOD_SECRET_NAME}: ${SQLPOD_CONNECTIONS}"
+        fi
+    fi
+
     # Named-connection env entries, generated from SQLPOD_CONNECTIONS. Both
     # keys are optional so the pod starts even before the secret keys exist;
     # queries against a missing key fail with the exact env-var name. The
@@ -178,6 +197,7 @@ cmd_status() {
     require_namespace
     check_kubectl
     kubectl get deployment,pods -n "$NAMESPACE" -l "app=${APP_NAME}"
+    status_connections
 }
 
 cmd_logs() {
@@ -245,6 +265,64 @@ validate_conn_name() {
     if ! [[ "$1" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
         log_error "Invalid connection name '$1' (want letters, digits, and dashes, starting with a letter)"
         exit 1
+    fi
+}
+
+# discover_connections lists the named connections already present in the
+# connection secret, from key names only (values are never read): every
+# conn-string-<name> key, minus the default read/write keys and the -write
+# counterparts of named connections. Keys that don't parse as connection
+# names (possible in a reused, hand-managed secret) are warned about and
+# skipped — deliberately not validate_conn_name, which would abort the
+# deploy. Prints a comma-separated list; a missing secret prints nothing.
+discover_connections() {
+    local keys
+    keys=$(kubectl get secret "$SQLPOD_SECRET_NAME" -n "$NAMESPACE" \
+        -o go-template='{{range $k, $v := .data}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null) || return 0
+    local key name result=""
+    while IFS= read -r key; do
+        case "$key" in
+            "$SQLPOD_SECRET_KEY"|conn-string-write) continue ;;
+            conn-string-*-write) continue ;;
+            conn-string-?*) name="${key#conn-string-}" ;;
+            *) continue ;;
+        esac
+        if ! [[ "$name" =~ ^[A-Za-z][A-Za-z0-9-]*$ ]]; then
+            # log_warn writes to stdout; redirect so the command substitution
+            # capturing our result doesn't swallow the warning into the list.
+            log_warn "Ignoring secret key '${key}': '${name}' is not a valid connection name" >&2
+            continue
+        fi
+        result+="${result:+,}${name}"
+    done <<< "$keys"
+    echo "$result"
+}
+
+# status_connections prints the named connections wired into the live
+# deployment's env next to those present in the secret, so drift (a key
+# added or removed since the last deploy) is visible without reading the
+# manifest. Env-var names map back to connection names unambiguously:
+# names never contain underscores, so lowercase + _ → - inverts deploy's
+# mapping. Missing deployment → print nothing (status already shows that).
+status_connections() {
+    local env_names name wired="" in_secret
+    env_names=$(kubectl get deployment "$APP_NAME" -n "$NAMESPACE" \
+        -o go-template='{{range .spec.template.spec.containers}}{{range .env}}{{.name}}{{"\n"}}{{end}}{{end}}' 2>/dev/null) || return 0
+    while IFS= read -r name; do
+        case "$name" in
+            SQLPOD_CONN|SQLPOD_CONN_WRITE) continue ;;
+            SQLPOD_CONN_*_WRITE) continue ;;
+            SQLPOD_CONN_?*) ;;
+            *) continue ;;
+        esac
+        name=$(echo "${name#SQLPOD_CONN_}" | tr '[:upper:]_' '[:lower:]-')
+        wired+="${wired:+,}${name}"
+    done <<< "$env_names"
+    in_secret=$(discover_connections)
+    echo "Named connections wired in deployment: ${wired:-(none)}"
+    echo "Named connections in secret:           ${in_secret:-(none)}"
+    if [ "$(tr ',' '\n' <<< "$wired" | sort)" != "$(tr ',' '\n' <<< "$in_secret" | sort)" ]; then
+        log_warn "Wired connections differ from the secret — run '${SCRIPT_NAME} deploy' to re-wire"
     fi
 }
 

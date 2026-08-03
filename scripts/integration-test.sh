@@ -179,17 +179,41 @@ DSN="postgres://postgres:${PG_PASSWORD}@postgres:5432/postgres?sslmode=disable"
 "$ROOT/manage.sh" set-conn "$DSN"
 "$ROOT/manage.sh" set-conn-write "$DSN"
 "$ROOT/manage.sh" set-conn --name orders "$DSN"
+"$ROOT/manage.sh" set-conn --name warehouse "$DSN"
+# A key set-conn's name validation would reject: deploy discovery must warn
+# and skip it, not fail. Written with the same merge patch set_conn_key uses.
+kubectl patch secret sqlpod-conn-secret -n "$NAMESPACE" --type=merge \
+    -p "{\"stringData\":{\"conn-string-my_db\":\"$DSN\"}}" > /dev/null
 
 # --- Build, push, deploy ------------------------------------------------------
 
 "$ROOT/manage.sh" build
 "$ROOT/manage.sh" push
-SQLPOD_CONNECTIONS=orders "$ROOT/manage.sh" deploy
 
-if "$ROOT/manage.sh" status > /dev/null; then
+# Deploy WITHOUT SQLPOD_CONNECTIONS: named connections must be discovered from
+# the secret's keys, tolerating the invalid conn-string-my_db key.
+if deploy_out=$("$ROOT/manage.sh" deploy 2>&1); then
+    check_pass "deploy without SQLPOD_CONNECTIONS succeeds despite invalid secret key"
+else
+    check_fail "deploy without SQLPOD_CONNECTIONS succeeds despite invalid secret key"
+    log_error "deploy output: $deploy_out"
+    exit 1
+fi
+if grep -q "conn-string-my_db" <<< "$deploy_out"; then
+    check_pass "deploy warns about the non-conn-name secret key"
+else
+    check_fail "deploy warns about the non-conn-name secret key — output: $deploy_out"
+fi
+
+if status_out=$("$ROOT/manage.sh" status); then
     check_pass "manage.sh status exits 0"
 else
     check_fail "manage.sh status exits 0"
+fi
+if grep -q "wired in deployment: orders,warehouse" <<< "$status_out"; then
+    check_pass "status lists discovered connections as wired"
+else
+    check_fail "status lists discovered connections as wired — output: $status_out"
 fi
 
 kubectl rollout status deployment/postgres -n "$NAMESPACE" --timeout=90s > /dev/null
@@ -255,6 +279,8 @@ assert_query "written rows are readable back" '.rows[0][0] == 2' \
 
 assert_query "named connection (--conn orders) works" '.rows[0][0] == 4' \
     query --conn orders "SELECT 4 AS four"
+assert_query "second discovered connection (--conn warehouse) works" '.rows[0][0] == 5' \
+    query --conn warehouse "SELECT 5 AS five"
 
 if "$ROOT/manage.sh" logs > /dev/null; then
     check_pass "manage.sh logs exits 0"
@@ -287,6 +313,20 @@ assert_query "NaN floats serialize as a string" '.rows[0][0] == "NaN"' \
     query "SELECT 'NaN'::float8 AS x"
 assert_query "non-UTF-8 bytea serializes as base64" '.rows[0][0] == "jwA="' \
     query "SELECT '\x8f00'::bytea AS b"
+
+# --- Explicit SQLPOD_CONNECTIONS= wires no named connections -------------------
+
+SQLPOD_CONNECTIONS= "$ROOT/manage.sh" deploy > /dev/null
+expect_fail "explicit empty SQLPOD_CONNECTIONS de-wires named connections" \
+    "SQLPOD_CONN_ORDERS is not set" \
+    "$ROOT/query.sh" query --conn orders "SELECT 1"
+assert_query "default connection still works with no named connections wired" \
+    '.rows[0][0] == 1' query "SELECT 1 AS one"
+if "$ROOT/manage.sh" status | grep -q "differ from the secret"; then
+    check_pass "status warns about wired-vs-secret drift"
+else
+    check_fail "status warns about wired-vs-secret drift"
+fi
 
 # --- Summary ------------------------------------------------------------------
 

@@ -118,6 +118,17 @@ own read and optional write credentials, selected per query.
   with `kubectl patch --type=merge` per key instead of re-applying the whole
   secret: preservation of unrelated keys holds by construction, and secrets are
   never `kubectl apply`'d at all anymore.*
+- Deploy discovery: `SQLPOD_CONNECTIONS` was originally the sole source of the
+  generated env block, so re-deploying without it silently dropped the
+  `SQLPOD_CONN_*` entries via apply's 3-way merge — the same hazard as above,
+  one layer up (the secret keys survived; only the wiring vanished). *Fixed:
+  the secret is the source of truth.* When the var is unset, deploy derives
+  names from the secret's key names — never values; non-name keys in reused
+  secrets are warned about and skipped. Unset = discover, explicitly empty =
+  wire none (for that deploy only), set = explicit override. This stays inside
+  the env-var convention rather than reopening the rejected mounted config
+  file: no new artifact, the keys `set-conn --name` already writes are simply
+  read back. `status` prints wired-vs-secret connections and warns on drift.
 
 **Rejected:**
 - *Mounted YAML config file*: adds a projected volume, a YAML dependency, and a
